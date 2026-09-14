@@ -1,42 +1,34 @@
 # Implementation notes
 
-See [README.md](README.md) for CLI behavior and operational usage.
+See [README.md](README.md) for operation, compatibility, and diagnostic limits.
 
-| Code | Responsibility |
+| Module | Responsibility |
 | --- | --- |
-| `src/config.rs` | Minimal shared endpoint/checkpoint configuration and command-specific bounds. |
-| `src/source.rs` | Typed `TempoNetwork` providers, authenticated finalized streams, full-block matching, and native transaction filtering. |
-| `src/state.rs` | Shared replay identity, ordered occurrence keys, failure evidence, and immutable JSON report output. |
-| `src/store.rs` | Bounded bincode RocksDB values, logical column families, synchronous batches, secondaries, disk bounds, and metrics. |
-| `src/mirror/` | Bounded exact-byte submission and durable per-occurrence intent/outcome evidence. |
-| `src/audit/` | Independent inclusion/receipt audit, finality liveness, system checks, retention, and incidents. |
-| `src/profile.rs` | Bounded source workload aggregation over an exact hash-bound range. |
-| `src/main.rs` | Independent command wiring, endpoint checks, inspection, metrics, and shutdown. |
+| `config.rs`, `main.rs` | One service configuration and read-only inspection; historical profiling stays independent. |
+| `source.rs` | Native envelopes, typed providers, authenticated headers/body roots, source and shadow epoch schedules, shadow network identity from the checkpoint DKG outcome. |
+| `state.rs` | Source occurrence identity, bounded RPC attempt evidence, receipt observations, derived findings. |
+| `evidence.rs` | Shared records, atomic dispatch/receipt cursors, one-to-one target matching, recovery/retention indexes. |
+| `store.rs` | RocksDB binary codec, synchronous batches, secondary snapshots, and disk bounds. |
+| `relay.rs` | Retried source stream with bounded prefetch, sequential nonce lanes, exact-byte submission, draining shutdown, conservative recovery. |
+| `observe.rs` | Separate source-receipt and target-finality workers, receipt identity checks, system checks. |
+| `service.rs` | Worker lifetime, observation drain, liveness metrics, retention, and shutdown. |
 
-## Trust and durability boundaries
+## Durability and scheduling
 
-- Finality comes from `tempo_consensus::FinalizedHeaderStream`, including certificate and DKG-transition verification.
-- A typed RPC block is accepted only when both its hash and full header match the authenticated finalized header.
-- Transactions remain native `TempoTxEnvelope` values through exact EIP-2718 encoding and submission.
-- The mirror synchronously commits one intent batch before dispatch and atomically commits outcomes plus the source cursor after the block drains. An intent is not proof that bytes reached the network.
-- The auditor atomically commits block evidence and its corresponding source or target cursor. Audit state never controls mirror dispatch.
-- Operational state uses ordered binary keys and bounded, varint bincode values in separate mirror/audit RocksDBs. JSON is only an export format.
-- Active RocksDB levels use LZ4 and the bottommost level uses Zstd. WAL sync is the crash-durability boundary; graceful flush is additional cleanup.
-- Successful audit detail is pruned with its hash index after the retention horizon. Failure, ambiguity, drift, liveness, and system-failure evidence is retained by default; successful system traffic is aggregated.
-- Ambiguous exact-byte submissions are retried from a bounded recent-block window without introducing audit-to-mirror feedback.
-- The target Tempo pool, not the mirror, owns nonce queues, admission, memory accounting, and eviction.
-- Long-running commands intentionally use supervisor restart as their process-level response to a failed RPC observation or ended authenticated stream.
+A source block's exact bytes are synchronously recorded before submission. Each round increments its durable budget before any request; outcomes and source completion advance in one batch. On shutdown, requests already issued are awaited and committed without advancing the cursor unless every queued occurrence completed; a block round after restart re-dispatches only occurrences without a committed outcome. On a hard crash, an intent remains ambiguous and retries consume the same bounded budget after restart. Interrupted intents are always handed back to `begin_round`, even with an exhausted budget, so `in_flight` is cleared. The in-memory progress value changes only after the database commit succeeds.
 
-## Failure evidence
+Relay and observers hold the shared writer only for database operations, never for RPC or retry sleeps. Source receipts may arrive before submission completes; completion enriches the current record instead of overwriting concurrent receipt observations. A source block's temporary receipt manifest is deleted only after both dispatch and receipt observation finish.
 
-Mirror records distinguish accepted, already-known, explicit rejection, possibly-included restart responses, and ambiguous delivery. RPC codes and bounded sanitized messages are retained where available. The independent auditor distinguishes missing-after-window, receipt drift, finality stalls, RPC observation failures, authenticated-history contiguity incidents, and system behavior, so absence is never treated as proof that submission failed.
+Hash indexes preserve `(source height, index)` and unmatched `(target height, index)` independently; a second unmatched index keyed by target location lets retention walk unmatched observations by age. Reconciliation consumes each target occurrence once, including multiple equal hashes within one batch and target observations that precede source ingestion.
 
-The inspector joins both databases by exact source `(height, index)` and transaction hash. Separate secondary snapshots have independent cursor boundaries, which are included in output.
+No finding state or per-finding counter is persisted. Inspection derives the current finding from source/target receipts and attempt evidence. The clean-inclusion and recovery indexes support bounded work without repeatedly scanning historical failures or all accepted-but-pending transactions. Recovery-index membership is computed with the store's `max_rounds` and the sampled target timestamp, so exhausted or expired records are not re-added by later enrichment. Pruning keeps aggregate counts for removed clean inclusions and aged-out unmatched target occurrences; anomalies retain evidence until disk bounds stop the service.
 
-## System checks
+The target finality stream is initialized with the shadow network identity read from the verified checkpoint header. Without it, every (re)initialization would derive the identity by fetching the entire checkpoint..cursor header range, which grows with shadow-fork age. `last_target_progress_ms` is reset on open so downtime before the process started is not reported as a stall.
 
-Source system and reserved subblock transactions are never submitted to the target pool. The auditor aggregates successful target-generated traffic and retains detailed evidence for native-envelope, hardfork-dependent count/order/destination, and receipt failures.
+## Limits
 
-## Deliberately absent
+Recovery is a bounded retry policy, not a second transaction pool or dependency scheduler. Sequential lanes preserve submission order within each block but do not enforce target inclusion order. Expiring nonces are independent. Source blocks drain serially; source prefetch is bounded to two queued blocks. There is no 1× catch-up pacing controller.
 
-There is no deployment `verify`/`qualify` subsystem, deployment evidence manifest, external pool-credit model, receipt comparison in dispatch, state-diff comparison, multi-ingress routing, catch-up pacing, audit-to-mirror reconciliation, or custom JSON-RPC/WebSocket/Prometheus implementation. Mirroring uses one target ingress and drains source blocks serially at configured submission concurrency.
+Node telemetry uses existing tracing and metrics at admission, eviction, and payload decisions. It is diagnostic, configurable, and potentially lossy. This service does not collect every node event, extract historical state, infer contract dependencies, or classify arbitrary reverts as harmless. A re-execution workflow must reconstruct the relevant parent state and execution prefix.
+
+The schema is intentionally incompatible with the former separate mirror/audit stores. Keep old evidence with its matching binary; initialize a new directory for the unified service. One process/store is a shared failure domain, even though receipt RPC outages do not gate the relay.

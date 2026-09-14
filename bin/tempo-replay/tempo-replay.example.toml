@@ -16,18 +16,13 @@ source_hash = "0x000000000000000000000000000000000000000000000000000000000000000
 target_hash = "0x0000000000000000000000000000000000000000000000000000000000000002"
 
 [run]
-state = "/var/lib/tempo-replay/mirror"
+state = "/var/lib/tempo-replay/evidence"
 metrics = "127.0.0.1:9090"
 concurrency = 64
 retries = 2
 retry_delay_ms = 250
-retain_completed_blocks = 10000
-max_bytes = 53687091200
-min_free_bytes = 5368709120
-
-[audit]
-state = "/var/lib/tempo-replay/audit"
-metrics = "127.0.0.1:9091"
+# Includes the initial submission and any crash/state/transport recovery rounds.
+max_rounds = 3
 missing_after_blocks = 64
 missing_after_seconds = 120
 retain_included_blocks = 10000

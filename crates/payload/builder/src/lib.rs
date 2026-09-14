@@ -79,7 +79,7 @@ use tempo_transaction_pool::{
     transaction::TempoPoolTransactionError,
 };
 use tokio::sync::oneshot;
-use tracing::{Level, debug, debug_span, info, instrument, trace, warn};
+use tracing::{debug, debug_span, info, instrument, trace, warn};
 
 /// Conservative estimate for non-transaction execution block RLP bytes.
 ///
@@ -284,7 +284,8 @@ where
         fields(
             id = %args.config.payload_id,
             parent_number = %args.config.parent_header.number(),
-            parent_hash = %args.config.parent_header.hash()
+            parent_hash = %args.config.parent_header.hash(),
+            timestamp_ms = args.config.attributes.timestamp_millis()
         )
     )]
     fn build_payload<Txs>(
@@ -563,6 +564,12 @@ where
                 break stop_reason;
             };
             let tx = pool_tx.tx.clone();
+            let record_skip = |reason: &'static str, invalid: bool| {
+                self.metrics.inc_pool_tx_skipped(reason);
+                trace!(target: "payload_builder", tx_hash = %tx.hash(), stage = "payload_selection",
+                    decision = if invalid { "invalid_in_payload" } else { "deferred_in_payload" }, reason,
+                    "Skipping transaction in this build, not evicting it from the pool");
+            };
             pool_transactions_yielded += 1;
 
             let max_regular_gas_used = core::cmp::min(
@@ -581,7 +588,7 @@ where
                         block_gas_limit - cumulative_gas_used,
                     ),
                 );
-                self.metrics.inc_pool_tx_skipped("exceeds_block_gas_limit");
+                record_skip("exceeds_block_gas_limit", false);
                 continue;
             }
 
@@ -600,8 +607,7 @@ where
                         TempoPoolTransactionError::ExceedsNonPaymentLimit,
                     )),
                 );
-                self.metrics
-                    .inc_pool_tx_skipped("exceeds_general_gas_limit");
+                record_skip("exceeds_general_gas_limit", false);
                 continue;
             }
 
@@ -621,14 +627,10 @@ where
                         limit: MAX_RLP_BLOCK_SIZE,
                     },
                 );
-                self.metrics.inc_pool_tx_skipped("oversized_block");
+                record_skip("oversized_block", false);
                 skipped_oversized_block = true;
                 continue;
             }
-
-            let tx_debug_repr = tracing::enabled!(Level::TRACE)
-                .then(|| format!("{:?}", tx.transaction))
-                .unwrap_or_default();
 
             let result_closure = |result: &TempoTxResult| {
                 cumulative_gas_used += result.block_gas_used();
@@ -673,19 +675,19 @@ where
 
                         if error.is_nonce_too_low() {
                             // if the nonce is too low, we can skip this transaction
-                            trace!(%error, tx = %tx_debug_repr, "skipping nonce too low transaction");
-                            self.metrics.inc_pool_tx_skipped("nonce_too_low");
+                            trace!(target: "payload_builder", %error, error_kind = ?error, tx_hash = %tx.hash(), stage = "payload_validation", "Skipping nonce too low transaction");
+                            record_skip("nonce_too_low", true);
                         } else {
                             // if the transaction is invalid, we can skip it and all of its
                             // descendants
-                            trace!(%error, tx = %tx_debug_repr, "skipping invalid transaction and its descendants");
+                            trace!(target: "payload_builder", %error, error_kind = ?error, tx_hash = %tx.hash(), stage = "payload_validation", "Skipping invalid transaction and its descendants in this build");
                             best_txs.mark_invalid(
                                 &pool_tx,
                                 InvalidPoolTransactionError::Consensus(
                                     InvalidTransactionError::TxTypeNotSupported,
                                 ),
                             );
-                            self.metrics.inc_pool_tx_skipped("invalid_tx");
+                            record_skip("invalid_tx", true);
                         }
                         continue;
                     }
@@ -700,10 +702,11 @@ where
                                     InvalidTransactionError::TxTypeNotSupported,
                                 ),
                             );
-                            self.metrics.inc_pool_tx_skipped("invalid_replay");
+                            record_skip("invalid_replay", true);
                             trace!(
                                 target: "payload_builder",
                                 tx_hash = ?tx.hash(),
+                                stage = "payload_validation",
                                 ?err,
                                 "Skipping invalid replay transaction"
                             );
@@ -716,7 +719,6 @@ where
                 }
             }
 
-            trace!("Transaction executed");
             if let Some(bal_task_handle) = &bal_task_handle {
                 bal_task_handle.bump_bal_index();
             }
@@ -724,6 +726,8 @@ where
             pool_transactions_included += 1;
             estimated_rlp_block_size += tx_rlp_length;
             let receipt = executor.receipts().last().unwrap().clone();
+            trace!(target: "payload_builder", tx_hash = %tx.hash(), stage = "payload_execution",
+                success = receipt.success, "Transaction executed in candidate payload; not yet finalized");
             if !receipt.success {
                 reverted_transactions += 1;
             }

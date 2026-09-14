@@ -15,6 +15,7 @@ use reth_rpc_eth_types::{
     },
 };
 use tempo_evm::TempoInvalidTransaction;
+use tempo_revm::error::FeePaymentError;
 use tempo_transaction_pool::transaction::TempoPoolTransactionError;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,9 +29,8 @@ impl From<TempoEthApiError> for jsonrpsee::types::error::ErrorObject<'static> {
         if let TempoEthApiError::EthApiError(EthApiError::PoolError(
             RpcPoolError::PoolTransactionError(err),
         )) = &error
-            && let Some(TempoPoolTransactionError::Evm(err)) =
-                err.as_any().downcast_ref::<TempoPoolTransactionError>()
-            && let Some(rpc_error) = fee_token_rpc_error(err)
+            && let Some(err) = err.as_any().downcast_ref::<TempoPoolTransactionError>()
+            && let Some(rpc_error) = pool_rpc_error(err)
         {
             return rpc_error;
         }
@@ -80,6 +80,30 @@ where
     }
 }
 
+fn pool_rpc_error(err: &TempoPoolTransactionError) -> Option<ErrorObject<'static>> {
+    let data = match err {
+        TempoPoolTransactionError::Evm(err) => return fee_token_rpc_error(err),
+        TempoPoolTransactionError::InvalidValidBefore(err) => serde_json::json!({
+            "name": "InvalidValidBeforeError", "validBefore": err.valid_before, "minAllowed": err.min_allowed,
+        }),
+        TempoPoolTransactionError::InvalidValidAfter(err) => serde_json::json!({
+            "name": "InvalidValidAfterError", "validAfter": err.valid_after, "maxAllowed": err.max_allowed,
+        }),
+        TempoPoolTransactionError::AccessKeyExpired {
+            expiry,
+            min_allowed,
+        } => serde_json::json!({
+            "name": "AccessKeyExpiredError", "expiry": expiry, "minAllowed": min_allowed,
+        }),
+        _ => return None,
+    };
+    Some(ErrorObject::owned(
+        EthRpcErrorCode::TransactionRejected.code(),
+        err.to_string(),
+        Some(data),
+    ))
+}
+
 fn fee_token_rpc_error(err: &TempoInvalidTransaction) -> Option<ErrorObject<'static>> {
     let data = match err {
         TempoInvalidTransaction::FeeTokenNotTip20 { address } => serde_json::json!({
@@ -96,6 +120,18 @@ fn fee_token_rpc_error(err: &TempoInvalidTransaction) -> Option<ErrorObject<'sta
         TempoInvalidTransaction::FeeTokenPaused { address } => serde_json::json!({
             "name": "FeeTokenPausedError",
             "token": address.to_string(),
+        }),
+        TempoInvalidTransaction::CollectFeePreTx(
+            FeePaymentError::InsufficientFeeTokenBalance { fee, balance },
+        ) => serde_json::json!({
+            "name": "InsufficientFeeTokenBalanceError", "fee": fee.to_string(), "balance": balance.to_string(),
+        }),
+        TempoInvalidTransaction::CollectFeePreTx(FeePaymentError::InsufficientAmmLiquidity {
+            user_token,
+            validator_token,
+            fee,
+        }) => serde_json::json!({
+            "name": "InsufficientAmmLiquidityError", "userToken": user_token, "validatorToken": validator_token, "fee": fee.to_string(),
         }),
         _ => return None,
     };
@@ -186,6 +222,34 @@ mod tests {
             assert!(rpc_error.message().contains(message));
             assert_eq!(rpc_error_data(&rpc_error), expected_data);
         }
+    }
+
+    #[test]
+    fn state_and_time_rejections_keep_structured_evidence() {
+        let error = TempoInvalidTransaction::CollectFeePreTx(
+            FeePaymentError::InsufficientFeeTokenBalance {
+                fee: alloy_primitives::U256::from(10),
+                balance: alloy_primitives::U256::from(3),
+            },
+        );
+        let rpc = into_rpc_error(error);
+        assert_eq!(
+            rpc_error_data(&rpc),
+            serde_json::json!({
+                "name": "InsufficientFeeTokenBalanceError", "fee": "10", "balance": "3",
+            })
+        );
+        let rpc = pool_rpc_error(&TempoPoolTransactionError::AccessKeyExpired {
+            expiry: 100,
+            min_allowed: 103,
+        })
+        .unwrap();
+        assert_eq!(
+            rpc_error_data(&rpc),
+            serde_json::json!({
+                "name": "AccessKeyExpiredError", "expiry": 100, "minAllowed": 103,
+            })
+        );
     }
 
     #[test]

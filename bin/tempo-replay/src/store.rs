@@ -101,6 +101,11 @@ impl Store {
         })
     }
 
+    pub fn identity(&self) -> Result<ReplayIdentity> {
+        self.get_default(IDENTITY_KEY)?
+            .context("missing replay identity")
+    }
+
     pub fn get_default<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>> {
         self.db.get(key)?.map(|value| decode(&value)).transpose()
     }

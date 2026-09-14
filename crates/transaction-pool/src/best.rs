@@ -196,6 +196,10 @@ where
             if let Some(&balance) = self.decreased_balances.get(&key)
                 && balance < best_tx.transaction.fee_token_cost()
             {
+                tracing::trace!(target: "payload_builder", tx_hash = %best_tx.hash(), stage = "payload_selection",
+                    reason = "fee_balance_decreased", decision = "deferred_in_payload", %balance,
+                    required = %best_tx.transaction.fee_token_cost(),
+                    "Skipping transaction after preceding executions changed the fee balance");
                 self.inner.mark_invalid(
                     &tx,
                     InvalidPoolTransactionError::Consensus(

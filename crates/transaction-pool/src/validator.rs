@@ -360,7 +360,27 @@ where
 
         transactions
             .into_iter()
-            .map(|(origin, transaction)| self.validate_one_with_evm(origin, transaction, &mut evm))
+            .map(|(origin, transaction)| {
+                let tx_hash = *transaction.hash();
+                let outcome = self.validate_one_with_evm(origin, transaction, &mut evm);
+                match &outcome {
+                    TransactionValidationOutcome::Invalid(_, error) => tracing::debug!(
+                        target: "txpool", %tx_hash, stage = "pool_admission", outcome = "rejected",
+                        sampled_tip_hash = ?self.cached_state.read().0,
+                        sampled_tip_timestamp = self.inner.fork_tracker().tip_timestamp(),
+                        %error, error_kind = ?error, "Pool validation rejected transaction"
+                    ),
+                    TransactionValidationOutcome::Error(_, error) => tracing::debug!(
+                        target: "txpool", %tx_hash, stage = "pool_admission", outcome = "error",
+                        %error, "Pool validation could not observe state"
+                    ),
+                    TransactionValidationOutcome::Valid { .. } => tracing::trace!(
+                        target: "txpool", %tx_hash, stage = "pool_admission", outcome = "validated",
+                        "Transaction passed validation; insertion may still fail"
+                    ),
+                }
+                outcome
+            })
             .collect()
     }
 

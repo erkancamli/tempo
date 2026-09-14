@@ -1,28 +1,22 @@
-//! Command-line entry point for the independent mirror, auditor, profiler, and inspector.
+//! Single-service replay, independent historical profiling, and read-only evidence inspection.
 
 use alloy::primitives::B256;
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::Serialize;
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::path::PathBuf;
 use tempo_replay::{
-    audit::{AuditReader, AuditStore, Auditor, Expectation, Incident},
     config::{Checkpoint, Config, Endpoint},
-    mirror::{Mirror, MirrorOccurrence, MirrorReader, MirrorStore},
-    profile,
+    evidence::{EvidenceStore, Progress, SharedStore},
+    now_ms, profile, service,
     source::{TempoProvider, block_hash, chain_id, finalized_stream},
-    state::{OccurrenceId, atomic_json},
+    state::{Finding, Incident, Occurrence, OccurrenceId, ReplayIdentity, atomic_json},
 };
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(version, about = "Mirror, audit, and profile finalized Tempo traffic")]
+#[command(version, about = "Mirror and observe finalized Tempo traffic")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -30,21 +24,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Mirror exact signed transactions from finalized source blocks.
+    /// Relay exact signed transactions and independently observe receipts in one service.
     Run {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
         to_block: Option<u64>,
     },
-    /// Independently compare finalized source and shadow execution.
-    Audit {
-        #[arg(long)]
-        config: PathBuf,
-        #[arg(long)]
-        to_block: Option<u64>,
-    },
-    /// Produce an immutable workload profile for an exact finalized source range.
+    /// Produce a workload profile over an exact finalized source range.
     Profile {
         #[arg(long)]
         config: PathBuf,
@@ -55,12 +42,10 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Correlate durable submission and audit evidence.
+    /// Inspect one consistent shared-store snapshot; no RPC requests are made.
     Inspect {
         #[arg(long)]
-        mirror_state: PathBuf,
-        #[arg(long)]
-        audit_state: PathBuf,
+        config: PathBuf,
         #[arg(long, conflicts_with = "source_block")]
         tx: Option<B256>,
         #[arg(long, requires = "index", conflicts_with = "tx")]
@@ -72,17 +57,17 @@ enum Command {
 
 #[derive(Serialize)]
 struct Inspection {
-    mirror_cursor: u64,
-    audit_source_cursor: u64,
-    audit_target_cursor: u64,
+    identity: ReplayIdentity,
+    observed_at_ms: u64,
+    progress: Progress,
     records: Vec<InspectionRecord>,
 }
 
 #[derive(Serialize)]
 struct InspectionRecord {
     occurrence: OccurrenceId,
-    mirror: Option<MirrorOccurrence>,
-    audit: Option<Expectation>,
+    finding: Finding,
+    evidence: Occurrence,
     incidents: Vec<Incident>,
 }
 
@@ -96,75 +81,45 @@ async fn main() -> Result<()> {
         .json()
         .with_writer(std::io::stderr)
         .init();
-
     match Cli::parse().command {
         Command::Run { config, to_block } => {
             let config = Config::load(&config)?;
             let (target_config, checkpoint, run) = config.run()?;
             ensure_end(to_block, checkpoint.height)?;
-            install_metrics(run.metrics)?;
+            if let Some(address) = run.metrics {
+                PrometheusBuilder::new()
+                    .with_http_listener(address)
+                    .install()
+                    .context("install Prometheus exporter")?;
+            }
             let (source, target) = connect_checked(&config, target_config, checkpoint).await?;
-            let path = run.store.state.clone();
+            let settings = run.clone();
             let identity = checkpoint.identity(config.chain_id);
-            let max_bytes = run.store.max_bytes();
-            let min_free_bytes = run.store.min_free_bytes();
             let store = tokio::task::spawn_blocking(move || {
-                MirrorStore::open(&path, identity, max_bytes, min_free_bytes)
+                EvidenceStore::open(
+                    &settings.store.state,
+                    identity,
+                    settings.max_rounds(),
+                    settings.store.max_bytes(),
+                    settings.store.min_free_bytes(),
+                )
             })
             .await??;
-            let cursor = store.state().source_cursor;
-            let finalized = finalized_stream(source.clone(), config.chain_id, cursor.hash).await?;
-            let state = Mirror {
+            ensure!(
+                to_block.is_none_or(|end| store.progress.source.height <= end),
+                "end block precedes the durable source cursor"
+            );
+            let progress = service::run(
                 source,
                 target,
-                finalized,
-                store: Arc::new(Mutex::new(store)),
-                concurrency: run.concurrency(),
-                retries: run.retries(),
-                retry_delay: Duration::from_millis(run.retry_delay_ms()),
-                retain_completed_blocks: run.retain_completed_blocks(),
+                SharedStore::new(store),
+                run.clone(),
+                config.chain_id,
                 to_block,
-            }
-            .run(shutdown_token())
+                shutdown_token(),
+            )
             .await?;
-            println!("{}", serde_json::to_string_pretty(&state)?);
-        }
-        Command::Audit { config, to_block } => {
-            let config = Config::load(&config)?;
-            let (target_config, checkpoint, audit) = config.audit()?;
-            ensure_end(to_block, checkpoint.height)?;
-            install_metrics(audit.metrics)?;
-            let (source, target) = connect_checked(&config, target_config, checkpoint).await?;
-            let path = audit.store.state.clone();
-            let identity = checkpoint.identity(config.chain_id);
-            let max_bytes = audit.store.max_bytes();
-            let min_free_bytes = audit.store.min_free_bytes();
-            let store = tokio::task::spawn_blocking(move || {
-                AuditStore::open(&path, identity, max_bytes, min_free_bytes)
-            })
-            .await??;
-            let source_cursor = store.source_cursor();
-            let target_cursor = store.target_cursor();
-            let source_finalized =
-                finalized_stream(source.clone(), config.chain_id, source_cursor.hash).await?;
-            let target_finalized =
-                finalized_stream(target.clone(), config.chain_id, target_cursor.hash).await?;
-            let summary = Auditor {
-                source,
-                target,
-                source_finalized,
-                target_finalized,
-                store: Arc::new(Mutex::new(store)),
-                source_to_block: to_block,
-                missing_after_blocks: audit.missing_after_blocks(),
-                missing_after: audit.missing_after(),
-                retain_included_blocks: audit.retain_included_blocks(),
-                finality_stall: audit.finality_stall(),
-                chain_id: config.chain_id,
-            }
-            .run(shutdown_token())
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            println!("{}", serde_json::to_string_pretty(&progress)?);
         }
         Command::Profile {
             config,
@@ -172,10 +127,9 @@ async fn main() -> Result<()> {
             to_block,
             output,
         } => {
-            ensure!(from_block <= to_block, "invalid profile range");
             ensure!(
-                from_block > 0,
-                "profiling must start after a checkpoint block"
+                from_block > 0 && from_block <= to_block,
+                "invalid profile range; start after a checkpoint block"
             );
             let config = Config::load(&config)?;
             let source = config.source.connect()?;
@@ -197,8 +151,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Inspect {
-            mirror_state,
-            audit_state,
+            config,
             tx,
             source_block,
             index,
@@ -207,101 +160,64 @@ async fn main() -> Result<()> {
                 tx.is_some() || source_block.is_some(),
                 "provide --tx or --source-block/--index"
             );
+            let config = Config::load(&config)?;
+            let settings = config.run()?.2.clone();
+            let identity = config.run()?.1.identity(config.chain_id);
             let inspection = tokio::task::spawn_blocking(move || {
-                inspect(&mirror_state, &audit_state, tx, source_block.zip(index))
+                let store = EvidenceStore::open_reader(&settings.store.state)?;
+                ensure!(
+                    store.identity()? == identity,
+                    "config does not match the stored replay identity"
+                );
+                let observed_at_ms = now_ms();
+                let evidence = if let Some(hash) = tx {
+                    store.by_hash(hash)?
+                } else if let Some((source_height, source_index)) = source_block.zip(index) {
+                    let id = OccurrenceId {
+                        source_height,
+                        source_index,
+                    };
+                    store
+                        .occurrence(id)?
+                        .map(|record| (id, record))
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let records = evidence
+                    .into_iter()
+                    .map(|(occurrence, evidence)| {
+                        let center = evidence
+                            .attempts
+                            .first()
+                            .map_or(evidence.queued_at_ms, |attempt| attempt.started_at_ms);
+                        Ok(InspectionRecord {
+                            occurrence,
+                            finding: evidence.finding(
+                                store.progress.target.height,
+                                observed_at_ms,
+                                settings.missing_after_blocks(),
+                                settings.missing_after().as_millis() as u64,
+                            ),
+                            incidents: store.incidents(
+                                center.saturating_sub(300_000),
+                                center.saturating_add(300_000),
+                            )?,
+                            evidence,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<_, anyhow::Error>(Inspection {
+                    identity,
+                    observed_at_ms,
+                    progress: store.progress,
+                    records,
+                })
             })
             .await??;
             println!("{}", serde_json::to_string_pretty(&inspection)?);
         }
-    }
-    Ok(())
-}
-
-fn inspect(
-    mirror_path: &std::path::Path,
-    audit_path: &std::path::Path,
-    hash: Option<B256>,
-    occurrence: Option<(u64, u32)>,
-) -> Result<Inspection> {
-    let mirror = MirrorReader::open(mirror_path)?;
-    let audit = AuditReader::open(audit_path)?;
-    let mirror_cursor = mirror.state()?.source_cursor.height;
-    let (audit_source, audit_target) = audit.cursors()?;
-    let audit_source_cursor = audit_source.height;
-    let audit_target_cursor = audit_target.height;
-
-    let records = if let Some(hash) = hash {
-        let mut records = BTreeMap::new();
-        for (id, record) in mirror.by_hash(hash)? {
-            records.entry(id).or_insert((None, None)).0 = Some(record);
-        }
-        for (id, record) in audit.by_hash(hash)? {
-            records.entry(id).or_insert((None, None)).1 = Some(record);
-        }
-        records
-            .into_iter()
-            .map(|(id, (mirror, audit_record))| inspection_record(&audit, id, mirror, audit_record))
-            .collect::<Result<_>>()?
-    } else if let Some((source_height, source_index)) = occurrence {
-        let id = OccurrenceId {
-            source_height,
-            source_index,
-        };
-        vec![inspection_record(
-            &audit,
-            id,
-            mirror.occurrence(id)?,
-            audit.occurrence(id)?,
-        )?]
-    } else {
-        Vec::new()
-    };
-    Ok(Inspection {
-        mirror_cursor,
-        audit_source_cursor,
-        audit_target_cursor,
-        records,
-    })
-}
-
-fn inspection_record(
-    audit_reader: &AuditReader,
-    occurrence: OccurrenceId,
-    mirror: Option<MirrorOccurrence>,
-    audit: Option<Expectation>,
-) -> Result<InspectionRecord> {
-    const INCIDENT_WINDOW_MS: u64 = 5 * 60 * 1_000;
-    let observed_at = audit
-        .as_ref()
-        .map(|expectation| expectation.observed_at_ms)
-        .or_else(|| {
-            mirror
-                .as_ref()
-                .map(|occurrence| occurrence.submission.started_at_ms)
-        });
-    let incidents = observed_at.map_or_else(
-        || Ok(Vec::new()),
-        |center| {
-            audit_reader.incidents(
-                center.saturating_sub(INCIDENT_WINDOW_MS),
-                center.saturating_add(INCIDENT_WINDOW_MS),
-            )
-        },
-    )?;
-    Ok(InspectionRecord {
-        occurrence,
-        mirror,
-        audit,
-        incidents,
-    })
-}
-
-fn install_metrics(address: Option<std::net::SocketAddr>) -> Result<()> {
-    if let Some(address) = address {
-        PrometheusBuilder::new()
-            .with_http_listener(address)
-            .install()
-            .context("install Prometheus exporter")?;
     }
     Ok(())
 }
@@ -343,8 +259,8 @@ fn ensure_end(to_block: Option<u64>, checkpoint_height: u64) -> Result<()> {
 async fn check_endpoint(
     provider: &TempoProvider,
     expected_chain_id: u64,
-    checkpoint_height: u64,
-    expected_checkpoint: B256,
+    height: u64,
+    expected: B256,
     name: &str,
 ) -> Result<()> {
     ensure!(
@@ -352,7 +268,7 @@ async fn check_endpoint(
         "{name} chain id mismatch"
     );
     ensure!(
-        block_hash(provider, checkpoint_height).await? == expected_checkpoint,
+        block_hash(provider, height).await? == expected,
         "{name} checkpoint hash mismatch"
     );
     Ok(())
@@ -362,30 +278,18 @@ fn shutdown_token() -> CancellationToken {
     let stop = CancellationToken::new();
     let signal = stop.clone();
     tokio::spawn(async move {
-        shutdown_signal().await;
-        signal.cancel();
-    });
-    stop
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
+        #[cfg(unix)]
         if let Ok(mut terminate) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-        } else {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            signal.cancel();
+            return;
         }
-    }
-    #[cfg(not(unix))]
-    {
         let _ = tokio::signal::ctrl_c().await;
-    }
+        signal.cancel();
+    });
+    stop
 }
 
 #[cfg(test)]
@@ -393,9 +297,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn command_flags_remain_stable() {
+    fn single_service_cli_rejects_legacy_split_state_flags() {
         assert!(Cli::try_parse_from(["tempo-replay", "run", "--config", "replay.toml"]).is_ok());
-        assert!(Cli::try_parse_from(["tempo-replay", "audit", "--config", "replay.toml"]).is_ok());
+        assert!(Cli::try_parse_from(["tempo-replay", "audit", "--config", "replay.toml"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "tempo-replay",
+                "inspect",
+                "--config",
+                "replay.toml",
+                "--source-block",
+                "1",
+                "--index",
+                "0"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "tempo-replay",
+                "inspect",
+                "--config",
+                "replay.toml",
+                "--source-block",
+                "1"
+            ])
+            .is_err()
+        );
         assert!(
             Cli::try_parse_from([
                 "tempo-replay",
@@ -403,11 +331,9 @@ mod tests {
                 "--mirror-state",
                 "mirror",
                 "--audit-state",
-                "audit",
-                "--tx",
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "audit"
             ])
-            .is_ok()
+            .is_err()
         );
     }
 }

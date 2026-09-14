@@ -1,15 +1,16 @@
-//! Shared implementation for finalized traffic mirroring, auditing, and profiling.
+//! Finalized traffic relay with shared evidence and independent receipt observation.
 
-pub mod audit;
 pub mod config;
-pub mod mirror;
+pub mod evidence;
+pub mod observe;
 pub mod profile;
+pub mod relay;
+pub mod service;
 pub mod source;
 pub mod state;
-#[doc(hidden)]
 pub mod store;
 
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -1,4 +1,4 @@
-//! Shared endpoint and checkpoint configuration with command-specific settings.
+//! Shared endpoint/checkpoint configuration and bounded single-service settings.
 
 use crate::{
     source::{TempoProvider, connect},
@@ -13,7 +13,6 @@ use std::{
     time::Duration,
 };
 
-/// Shared configuration loaded by all `tempo-replay` commands.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -22,7 +21,6 @@ pub struct Config {
     pub target: Option<Endpoint>,
     pub checkpoint: Option<Checkpoint>,
     pub run: Option<Run>,
-    pub audit: Option<Audit>,
 }
 
 impl Config {
@@ -31,18 +29,36 @@ impl Config {
             &std::fs::read_to_string(path)
                 .with_context(|| format!("read config {}", path.display()))?,
         )
-        .with_context(|| format!("parse config {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "parse config {} (legacy [audit] settings now belong in [run])",
+                path.display()
+            )
+        })?;
         ensure!(config.chain_id > 0, "chain id must be positive");
         Ok(config)
     }
 
     pub fn run(&self) -> Result<(&Endpoint, &Checkpoint, &Run)> {
-        let (target, checkpoint) = self.target_checkpoint("run")?;
+        let target = self.target.as_ref().context("run requires [target]")?;
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .context("run requires [checkpoint]")?;
         let run = self.run.as_ref().context("run requires [run]")?;
-        ensure!(run.concurrency() > 0, "run concurrency must be positive");
+        ensure!(run.concurrency() > 0, "concurrency must be positive");
         ensure!(
-            run.store.max_bytes() > 0,
-            "run database limit must be positive"
+            run.retries() <= 4 && (1..=8).contains(&run.max_rounds()),
+            "retries must be <= 4 and max_rounds in 1..=8"
+        );
+        ensure!(
+            run.retry_delay_ms() <= 60_000,
+            "retry_delay_ms must be <= 60000"
+        );
+        ensure!(run.store.max_bytes() > 0, "database limit must be positive");
+        ensure!(
+            run.missing_after_blocks() > 0 || !run.missing_after().is_zero(),
+            "missing horizon must be positive"
         );
         ensure!(
             checkpoint.source_hash != checkpoint.target_hash,
@@ -50,38 +66,8 @@ impl Config {
         );
         Ok((target, checkpoint, run))
     }
-
-    pub fn audit(&self) -> Result<(&Endpoint, &Checkpoint, &Audit)> {
-        let (target, checkpoint) = self.target_checkpoint("audit")?;
-        let audit = self.audit.as_ref().context("audit requires [audit]")?;
-        ensure!(
-            audit.missing_after_blocks() > 0 || !audit.missing_after().is_zero(),
-            "audit missing horizon must be positive"
-        );
-        ensure!(
-            audit.store.max_bytes() > 0,
-            "audit database limit must be positive"
-        );
-        ensure!(
-            checkpoint.source_hash != checkpoint.target_hash,
-            "source and patched target checkpoint hashes must differ"
-        );
-        Ok((target, checkpoint, audit))
-    }
-
-    fn target_checkpoint(&self, command: &str) -> Result<(&Endpoint, &Checkpoint)> {
-        Ok((
-            self.target
-                .as_ref()
-                .with_context(|| format!("{command} requires [target]"))?,
-            self.checkpoint
-                .as_ref()
-                .with_context(|| format!("{command} requires [checkpoint]"))?,
-        ))
-    }
 }
 
-/// RPC endpoint with optional bearer-token and private-CA configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
@@ -115,7 +101,6 @@ impl Endpoint {
     }
 }
 
-/// Source snapshot boundary and its patched shadow-fork counterpart.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
@@ -135,7 +120,6 @@ impl Checkpoint {
     }
 }
 
-/// Mirror persistence, concurrency, and retry settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
@@ -145,68 +129,40 @@ pub struct Run {
     concurrency: Option<usize>,
     retries: Option<u32>,
     retry_delay_ms: Option<u64>,
-    retain_completed_blocks: Option<u64>,
+    max_rounds: Option<u32>,
+    retain_included_blocks: Option<u64>,
+    missing_after_blocks: Option<u64>,
+    missing_after_seconds: Option<u64>,
+    finality_stall_seconds: Option<u64>,
 }
 
 impl Run {
     pub fn concurrency(&self) -> usize {
-        self.concurrency.unwrap_or(DEFAULT_CONCURRENCY)
+        self.concurrency.unwrap_or(64)
     }
-
     pub fn retries(&self) -> u32 {
-        self.retries.unwrap_or(DEFAULT_RETRIES)
+        self.retries.unwrap_or(2)
     }
-
     pub fn retry_delay_ms(&self) -> u64 {
-        self.retry_delay_ms.unwrap_or(DEFAULT_RETRY_DELAY_MS)
+        self.retry_delay_ms.unwrap_or(250)
     }
-
-    pub fn retain_completed_blocks(&self) -> u64 {
-        self.retain_completed_blocks
-            .unwrap_or(DEFAULT_RETAIN_COMPLETED_BLOCKS)
+    pub fn max_rounds(&self) -> u32 {
+        self.max_rounds.unwrap_or(3)
     }
-}
-
-/// Auditor persistence, missing horizon, and retention settings.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Audit {
-    #[serde(flatten)]
-    pub store: StoreConfig,
-    pub metrics: Option<SocketAddr>,
-    missing_after_blocks: Option<u64>,
-    missing_after_seconds: Option<u64>,
-    retain_included_blocks: Option<u64>,
-    finality_stall_seconds: Option<u64>,
-}
-
-impl Audit {
-    pub fn missing_after_blocks(&self) -> u64 {
-        self.missing_after_blocks
-            .unwrap_or(DEFAULT_MISSING_AFTER_BLOCKS)
-    }
-
-    pub fn missing_after(&self) -> Duration {
-        Duration::from_secs(
-            self.missing_after_seconds
-                .unwrap_or(DEFAULT_MISSING_AFTER_SECONDS),
-        )
-    }
-
     pub fn retain_included_blocks(&self) -> u64 {
-        self.retain_included_blocks
-            .unwrap_or(DEFAULT_RETAIN_INCLUDED_BLOCKS)
+        self.retain_included_blocks.unwrap_or(10_000)
     }
-
+    pub fn missing_after_blocks(&self) -> u64 {
+        self.missing_after_blocks.unwrap_or(64)
+    }
+    pub fn missing_after(&self) -> Duration {
+        Duration::from_secs(self.missing_after_seconds.unwrap_or(120))
+    }
     pub fn finality_stall(&self) -> Duration {
-        Duration::from_secs(
-            self.finality_stall_seconds
-                .unwrap_or(DEFAULT_FINALITY_STALL_SECONDS),
-        )
+        Duration::from_secs(self.finality_stall_seconds.unwrap_or(30))
     }
 }
 
-/// RocksDB path and disk bounds shared by long-running commands.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StoreConfig {
     pub state: PathBuf,
@@ -216,55 +172,48 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes.unwrap_or(DEFAULT_MAX_BYTES)
+        self.max_bytes.unwrap_or(50 * 1024 * 1024 * 1024)
     }
-
     pub fn min_free_bytes(&self) -> u64 {
-        self.min_free_bytes.unwrap_or(DEFAULT_MIN_FREE_BYTES)
+        self.min_free_bytes.unwrap_or(5 * 1024 * 1024 * 1024)
     }
 }
-
-const DEFAULT_CONCURRENCY: usize = 64;
-const DEFAULT_RETRIES: u32 = 2;
-const DEFAULT_RETRY_DELAY_MS: u64 = 250;
-const DEFAULT_RETAIN_COMPLETED_BLOCKS: u64 = 10_000;
-const DEFAULT_MISSING_AFTER_BLOCKS: u64 = 64;
-const DEFAULT_MISSING_AFTER_SECONDS: u64 = 120;
-const DEFAULT_RETAIN_INCLUDED_BLOCKS: u64 = 10_000;
-const DEFAULT_FINALITY_STALL_SECONDS: u64 = 30;
-const DEFAULT_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
-const DEFAULT_MIN_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn example_config_parses_and_has_independent_state() {
+    fn example_config_uses_one_store_and_bounded_settings() {
         let config: Config = toml::from_str(include_str!("../tempo-replay.example.toml")).unwrap();
         let (_, _, run) = config.run().unwrap();
-        let (_, _, audit) = config.audit().unwrap();
-        assert_ne!(run.store.state, audit.store.state);
         assert_eq!(run.concurrency(), 64);
-        assert_eq!(audit.missing_after_blocks(), 64);
+        assert_eq!(run.max_rounds(), 3);
+        assert_eq!(run.missing_after_blocks(), 64);
     }
 
     #[test]
-    fn omitted_tuning_uses_named_defaults() {
-        let run: Run = toml::from_str("state = 'mirror'").unwrap();
-        assert_eq!(run.concurrency(), DEFAULT_CONCURRENCY);
-        assert_eq!(run.retries(), DEFAULT_RETRIES);
-        assert_eq!(run.retry_delay_ms(), DEFAULT_RETRY_DELAY_MS);
+    fn omitted_tuning_has_bounded_defaults() {
+        let run: Run = toml::from_str("state = 'replay'").unwrap();
+        assert_eq!(run.concurrency(), 64);
+        assert_eq!(run.retries(), 2);
+        assert_eq!(run.retry_delay_ms(), 250);
+        assert_eq!(run.missing_after(), Duration::from_secs(120));
+        assert_eq!(run.retain_included_blocks(), 10_000);
+    }
 
-        let audit: Audit = toml::from_str("state = 'audit'").unwrap();
-        assert_eq!(audit.missing_after_blocks(), DEFAULT_MISSING_AFTER_BLOCKS);
-        assert_eq!(
-            audit.missing_after(),
-            Duration::from_secs(DEFAULT_MISSING_AFTER_SECONDS)
-        );
-        assert_eq!(
-            audit.retain_included_blocks(),
-            DEFAULT_RETAIN_INCLUDED_BLOCKS
+    #[test]
+    fn rejects_unbounded_retry_configuration_and_legacy_audit_section() {
+        let mut config: Config =
+            toml::from_str(include_str!("../tempo-replay.example.toml")).unwrap();
+        config.run.as_mut().unwrap().max_rounds = Some(9);
+        assert!(config.run().is_err());
+        assert!(
+            toml::from_str::<Config>(&format!(
+                "{}\n[audit]\nstate = 'old'",
+                include_str!("../tempo-replay.example.toml")
+            ))
+            .is_err()
         );
     }
 
@@ -286,15 +235,8 @@ mod tests {
 
     #[test]
     fn profile_only_config_does_not_require_a_target() {
-        let config: Config = toml::from_str(
-            r#"
-chain_id = 4217
-[source]
-url = "https://source.example"
-"#,
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("chain_id = 4217\n[source]\nurl = 'https://source.example'").unwrap();
         assert!(config.run().is_err());
-        assert!(config.audit().is_err());
     }
 }

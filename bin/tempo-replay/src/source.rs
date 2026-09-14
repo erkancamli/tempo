@@ -11,10 +11,13 @@ use alloy::{
     providers::{Provider, RootProvider, builder},
 };
 use anyhow::{Context, Result, ensure};
+use commonware_codec::ReadExt as _;
 use reth_primitives_traits::SealedHeader;
+use serde::{Deserialize, Serialize};
 use tempo_alloy::TempoNetwork;
-use tempo_chainspec::spec::chainspec_from_chain_id;
+use tempo_chainspec::{NetworkIdentity, spec::chainspec_from_chain_id};
 use tempo_consensus::finalized_header_stream::{Config, FinalizedHeaderStream};
+use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_primitives::{TempoHeader, TempoTxEnvelope};
 
 /// Typed Alloy provider for Tempo RPC responses.
@@ -51,7 +54,7 @@ impl TxMetadata {
 }
 
 /// Shared fields for a non-system transaction.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplayMetadata {
     pub hash: B256,
     pub transaction_type: u8,
@@ -62,6 +65,7 @@ pub struct ReplayMetadata {
     pub encoded_length: u64,
     pub gas_limit: u64,
     pub valid_before: Option<u64>,
+    pub valid_after: Option<u64>,
 }
 
 impl ReplayMetadata {
@@ -78,6 +82,9 @@ impl ReplayMetadata {
             encoded_length: transaction.encode_2718_len() as u64,
             gas_limit: transaction.gas_limit(),
             valid_before: transaction.valid_before(),
+            valid_after: transaction
+                .as_aa()
+                .and_then(|tx| tx.tx().valid_after.map(core::num::NonZeroU64::get)),
         })
     }
 }
@@ -98,6 +105,7 @@ pub fn connect(
     }
     let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
         .default_headers(headers);
     if let Some(pem) = ca_pem {
         client = client.add_root_certificate(
@@ -144,41 +152,134 @@ pub async fn finalized_stream(
     .context("initialize authenticated finalized stream")
 }
 
+/// bootstrap-shadowfork sets epochLength = boundary height + 1 and installs a private DKG
+/// outcome. Authenticate from that pinned history, not mainnet's epoch schedule or committee.
+///
+/// The identity is passed explicitly: without it the stream derives one by fetching every
+/// header from the checkpoint boundary to `start_after` on each (re)initialization.
+pub async fn shadow_finalized_stream(
+    provider: TempoProvider,
+    start_after: B256,
+    checkpoint_height: u64,
+    identity: NetworkIdentity,
+) -> Result<FinalizedHeaderStream> {
+    FinalizedHeaderStream::init(
+        provider,
+        shadow_config(start_after, checkpoint_height, identity)?,
+    )
+    .await
+    .context("initialize authenticated shadow finalized stream")
+}
+
+/// Reads the private shadow DKG outcome from the verified checkpoint boundary header once.
+pub async fn shadow_network_identity(
+    provider: &TempoProvider,
+    checkpoint: BlockCursor,
+) -> Result<NetworkIdentity> {
+    let header = provider
+        .get_header_by_hash(checkpoint.hash)
+        .await
+        .context("fetch shadow checkpoint header")?
+        .with_context(|| format!("shadow checkpoint {} is unavailable", checkpoint.height))?;
+    let sealed = SealedHeader::seal_slow(header.inner.inner);
+    ensure!(
+        sealed.hash() == checkpoint.hash && sealed.number() == checkpoint.height,
+        HistoryError("shadow checkpoint header disagrees with the configured checkpoint")
+    );
+    shadow_identity_from_boundary(&sealed)
+}
+
+fn shadow_identity_from_boundary(boundary: &SealedHeader<TempoHeader>) -> Result<NetworkIdentity> {
+    let outcome = OnchainDkgOutcome::read(&mut boundary.extra_data().as_ref())
+        .map_err(|error| anyhow::anyhow!("{error}"))
+        .context(HistoryError(
+            "shadow checkpoint header does not contain a valid DKG outcome",
+        ))?;
+    Ok(NetworkIdentity {
+        from_epoch: outcome.epoch.get(),
+        identity: *outcome.network_identity(),
+    })
+}
+
+fn shadow_config(
+    start_after: B256,
+    checkpoint_height: u64,
+    identity: NetworkIdentity,
+) -> Result<Config> {
+    let epoch_length = checkpoint_height
+        .checked_add(1)
+        .and_then(core::num::NonZeroU64::new)
+        .context("checkpoint overflows shadow epoch length")?;
+    Ok(Config::new(start_after, Some(identity), epoch_length))
+}
+
 pub async fn fetch_finalized_block(
     provider: &TempoProvider,
     header: &SealedHeader<TempoHeader>,
 ) -> Result<FinalizedBlock> {
     let number = header.number();
+    // Fetch by authenticated hash: a lagging or forked RPC can only report the block as
+    // missing (retryable), never hand back a different block at the same height.
     let block = provider
-        .get_block_by_number(number.into())
+        .get_block_by_hash(header.hash())
         .full()
         .await
         .context("fetch full finalized block")?
         .with_context(|| format!("finalized block {number} is unavailable"))?;
     ensure!(
         block.header.hash == header.hash(),
-        "RPC block hash disagrees with authenticated finalized header at {number}"
+        HistoryError("RPC block hash disagrees with authenticated finalized header")
     );
     ensure!(
         block.header.inner.inner == **header,
-        "RPC block header disagrees with authenticated finalized header at {number}"
+        HistoryError("RPC block header disagrees with authenticated finalized header")
+    );
+    let transactions: Vec<_> = block
+        .transactions
+        .into_transactions()
+        .map(|tx| tx.into_inner())
+        .collect();
+    ensure!(
+        alloy::consensus::proofs::calculate_transaction_root(&transactions)
+            == header.transactions_root(),
+        HistoryError("RPC transaction body disagrees with authenticated finalized header")
     );
     Ok(FinalizedBlock {
         cursor: BlockCursor {
             height: number,
             hash: header.hash(),
         },
-        timestamp_ms: block.header.timestamp_millis,
-        transactions: block
-            .transactions
-            .into_transactions()
-            .map(|transaction| transaction.into_inner())
-            .collect(),
+        timestamp_ms: header.timestamp_millis(),
+        transactions,
     })
 }
 
 pub fn replayable(transaction: &TempoTxEnvelope) -> bool {
     !transaction.is_system_tx() && !transaction.has_sub_block_nonce_key_prefix()
+}
+
+/// A fetched block must agree with the authenticated chain, not just an RPC height.
+#[derive(Debug)]
+pub struct HistoryError(pub &'static str);
+
+impl std::fmt::Display for HistoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for HistoryError {}
+
+pub fn history_failure(error: &anyhow::Error) -> bool {
+    use tempo_consensus::finalized_header_stream::Error;
+    error.is::<HistoryError>()
+        || error.downcast_ref::<Error>().is_some_and(|error| {
+            !matches!(
+                error,
+                Error::Rpc(_)
+                    | Error::MissingHeader(_)
+                    | Error::MissingTransitionCertificate { .. }
+            )
+        })
 }
 
 #[cfg(test)]
@@ -190,6 +291,28 @@ mod tests {
         primitives::{Signature, U256},
     };
     use tempo_primitives::{TempoSignature, TempoTransaction, transaction::PrimitiveSignature};
+
+    #[test]
+    fn shadow_finality_uses_the_patched_epoch_schedule_and_pinned_private_history() {
+        let start = B256::repeat_byte(1);
+        let identity = chainspec_from_chain_id(4217)
+            .unwrap()
+            .network_identity
+            .clone()
+            .expect("mainnet has a compiled network identity");
+        let config = shadow_config(start, 120_000, identity.clone()).unwrap();
+        assert_eq!(config.start_after, start);
+        assert_eq!(config.epoch_length.get(), 120_001);
+        assert_eq!(config.network_identity, Some(identity.clone()));
+        assert!(shadow_config(start, u64::MAX, identity).is_err());
+        let garbage = SealedHeader::seal_slow(TempoHeader::default());
+        let error = shadow_identity_from_boundary(&garbage).unwrap_err();
+        assert!(history_failure(&error));
+        assert!(history_failure(
+            &anyhow::Error::new(HistoryError("bad body")).context("RPC block")
+        ));
+        assert!(!history_failure(&anyhow::anyhow!("RPC unavailable")));
+    }
 
     #[test]
     fn replay_filter_uses_native_system_and_subblock_classification() {

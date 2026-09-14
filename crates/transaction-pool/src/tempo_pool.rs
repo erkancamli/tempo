@@ -227,6 +227,14 @@ where
         };
 
         let mut to_remove = Vec::new();
+        let mut evict = |tx: &Arc<ValidPoolTransaction<TempoPooledTransaction>>,
+                         reason: &'static str| {
+            tracing::debug!(target: "txpool", tx_hash = %tx.hash(), stage = "pool_eviction", reason,
+                sampled_tip_timestamp = tip_timestamp, ?expiry_cutoff,
+                valid_before = ?tx.transaction.inner().valid_before(), key_expiry = ?tx.transaction.key_expiry(),
+                "Selected transaction for state-update eviction");
+            to_remove.push(*tx.hash());
+        };
         let mut revoked_count = 0;
         let mut key_authorization_target_count = 0;
         let mut spending_limit_count = 0;
@@ -246,7 +254,7 @@ where
 
         for tx in transactions {
             if expiry_cutoff.is_some_and(|cutoff| tx.transaction.is_expired_by(cutoff)) {
-                to_remove.push(*tx.hash());
+                evict(tx, "expiry_cutoff");
                 continue;
             }
 
@@ -255,7 +263,7 @@ where
                     .paused_tokens
                     .contains(&tx.transaction.effective_fee_token())
             {
-                to_remove.push(*tx.hash());
+                evict(tx, "fee_token_paused");
                 paused_token_count += 1;
                 continue;
             }
@@ -281,7 +289,7 @@ where
                             .as_ref()
                             .is_some_and(|subject| subject.matches_revoked(&updates.revoked_keys)))
                 {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "key_revoked");
                     revoked_count += 1;
                     continue;
                 }
@@ -292,7 +300,7 @@ where
                         subject.matches_key_update(&updates.key_authorization_target_changes)
                     })
                 {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "authorization_target_changed");
                     key_authorization_target_count += 1;
                     continue;
                 }
@@ -304,7 +312,7 @@ where
                     && subject.matches_spending_limit_update(&updates.spending_limit_changes)
                     && tx.transaction.is_sender_paid_fee()
                 {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "spending_limit_changed");
                     spending_limit_count += 1;
                     continue;
                 }
@@ -327,7 +335,7 @@ where
                         spec,
                     )
                 {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "spending_limit_exhausted");
                     spending_limit_spend_count += 1;
                     continue;
                 }
@@ -341,7 +349,7 @@ where
                     .get(&subject.account)
                     .is_some_and(|witnesses| witnesses.contains(&subject.witness))
             {
-                to_remove.push(*tx.hash());
+                evict(tx, "authorization_witness_burned");
                 key_authorization_witness_count += 1;
                 continue;
             }
@@ -357,7 +365,7 @@ where
                 match amm_cache.has_enough_liquidity(user_token, cost, provider) {
                     Ok(true) => {}
                     Ok(false) => {
-                        to_remove.push(*tx.hash());
+                        evict(tx, "fee_amm_liquidity");
                         liquidity_count += 1;
                         continue;
                     }
@@ -395,7 +403,7 @@ where
                         };
 
                         if balance < tx.transaction.fee_token_cost() {
-                            to_remove.push(*tx.hash());
+                            evict(tx, "fee_payer_balance");
                             insolvent_fee_payer_count += 1;
                             continue;
                         }
@@ -442,7 +450,7 @@ where
                         .is_some_and(|ids| fee_manager_blacklisted.iter().any(|p| ids.contains(p)));
 
                 if sender_evicted || recipient_evicted {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "fee_payer_blacklisted");
                     blacklisted_count += 1;
                 }
             }
@@ -486,7 +494,7 @@ where
                     });
 
                 if sender_evicted || recipient_evicted {
-                    to_remove.push(*tx.hash());
+                    evict(tx, "fee_payer_unwhitelisted");
                     unwhitelisted_count += 1;
                 }
             }
@@ -503,7 +511,7 @@ where
                     .fee_payer()
                     .is_ok_and(|fee_payer| updates.user_token_changes.contains(&fee_payer))
             {
-                to_remove.push(*tx.hash());
+                evict(tx, "fee_token_preference_changed");
                 user_token_count += 1;
             }
         }
@@ -541,7 +549,14 @@ where
         origin: TransactionOrigin,
         transaction: TransactionValidationOutcome<TempoPooledTransaction>,
     ) -> PoolResult<AddedTransactionOutcome> {
-        match transaction {
+        let tx_hash = match &transaction {
+            TransactionValidationOutcome::Valid { transaction, .. } => {
+                *transaction.transaction().hash()
+            }
+            TransactionValidationOutcome::Invalid(tx, _) => *tx.hash(),
+            TransactionValidationOutcome::Error(hash, _) => *hash,
+        };
+        let result = (|| match transaction {
             TransactionValidationOutcome::Valid {
                 balance,
                 state_nonce,
@@ -619,7 +634,16 @@ where
                     .pop()
                     .unwrap()
             }
+        })();
+        match &result {
+            Ok(added) => {
+                tracing::trace!(target: "txpool", %tx_hash, stage = "pool_insertion", state = ?added.state, "Transaction inserted")
+            }
+            Err(error) => {
+                tracing::debug!(target: "txpool", %tx_hash, stage = "pool_insertion", %error, "Transaction was not inserted")
+            }
         }
+        result
     }
 }
 

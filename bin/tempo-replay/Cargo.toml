@@ -20,12 +20,14 @@ workspace = true
 tempo-alloy.workspace = true
 tempo-chainspec = { workspace = true, features = ["reth"] }
 tempo-consensus.workspace = true
+tempo-dkg-onchain-artifacts.workspace = true
 tempo-primitives = { workspace = true, features = ["std", "serde"] }
 
 alloy = { workspace = true, features = ["providers", "provider-http", "reqwest-rustls-tls", "rlp", "rpc-types-eth", "transports"] }
 anyhow = "1"
 bincode = "1.3"
 clap.workspace = true
+commonware-codec.workspace = true
 fs4 = "0.13"
 futures-util = "0.3"
 metrics = "0.24"
