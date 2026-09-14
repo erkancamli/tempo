@@ -2152,7 +2152,8 @@ impl Borrow<EvictionOrderKey> for EvictionKey {
 
 impl PartialEq for EvictionKey {
     fn eq(&self, other: &Self) -> bool {
-        self.submission_id() == other.submission_id()
+        // Must stay in sync with `Ord`, and with `EvictionOrderKey` behind `Borrow`.
+        self.order == other.order
     }
 }
 
@@ -7922,5 +7923,26 @@ mod tests {
         assert!(first.is_some(), "should yield the expiring nonce tx");
         assert_eq!(*first.unwrap().hash(), tx_hash);
         assert!(best.next().is_none());
+    }
+
+    #[test]
+    fn eviction_key_eq_agrees_with_ord() {
+        let tx_id = AA2dTransactionId::new(AASequenceId::new(Address::random(), U256::ZERO), 0);
+        // The same transaction keyed at two different base fees: same submission id,
+        // different priority snapshot.
+        let cheap = EvictionKey {
+            tx_id,
+            order: EvictionOrderKey::new(Priority::Value(1), 7),
+        };
+        let rich = EvictionKey {
+            tx_id,
+            order: EvictionOrderKey::new(Priority::Value(2), 7),
+        };
+
+        // `Ord` sorts them apart, so `Eq` must not call them the same key. `BTreeSet`
+        // and the `Borrow<EvictionOrderKey>` lookups rely on the two agreeing.
+        assert_ne!(cheap.cmp(&rich), std::cmp::Ordering::Equal);
+        assert_ne!(cheap, rich);
+        assert_eq!(cheap, cheap.clone());
     }
 }
