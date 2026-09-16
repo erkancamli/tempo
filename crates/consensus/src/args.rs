@@ -397,8 +397,9 @@ impl FromStr for PositiveDuration {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let duration = s.parse::<jiff::SignedDuration>()?;
-        // `TryInto<Duration>` only rejects negatives, so zero would otherwise
-        // pass and break both this type's contract and `into_duration`'s expect.
+        // `TryInto<Duration>` only rejects negatives, so zero passes it and reaches
+        // `simplex::Config`, whose `assert` requires each timeout to be greater than
+        // zero and panics at epoch entry rather than at startup.
         let duration_std: Duration = duration.try_into().wrap_err("duration must be positive")?;
         if duration_std.is_zero() {
             return Err("duration must be greater than zero".into());
