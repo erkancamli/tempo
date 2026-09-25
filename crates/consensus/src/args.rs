@@ -933,8 +933,7 @@ mod tests {
             "--consensus.wait-to-rebroadcast-nullify",
             "--consensus.wait-for-peer-response",
         ] {
-            let rejected = match TestCli::try_parse_from(["test", "--dev", flag, "0s"].into_iter())
-            {
+            let rejected = match TestCli::try_parse_from(["test", "--dev", flag, "0s"]) {
                 Err(_) => true,
                 Ok(cli) => cli.consensus.validate_simplex_timing().is_err(),
             };
